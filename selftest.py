@@ -120,6 +120,12 @@ def answer(client, token, reply):
     )
 
 
+def reissue(client, host_token, name, url):
+    return client.post(
+        f"/api/h/{host_token}/reissue", json={"name": name, "url": url}
+    )
+
+
 def publish_with_reviews(client, host_token, tokens, reviews=("甲评乙", "乙评丙", "丙评甲")):
     """三人首轮意见全部提交并一次公布，返回各 token。"""
     for tok, content in zip(tokens, reviews):
@@ -529,6 +535,310 @@ class ClarificationTest(unittest.TestCase):
         self.assertEqual(submit_review(self.client, self.t_jia, "x", 1).status_code, 409)
 
 
+class ReissueLinkTest(unittest.TestCase):
+    """个人链接换发：404/409 规则、旧链接失效不泄露新链接、数据沿用、并发与提交顺序。"""
+
+    def setUp(self):
+        self.client = new_client()
+        self.host_token, self.tokens = create_session(self.client)
+        self.t_jia, self.t_yi, self.t_bing = self.tokens
+
+    def _reissue(self, token=None, name="甲"):
+        token = self.t_jia if token is None else token
+        resp = reissue(self.client, self.host_token, name, f"/p/{token}")
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        new_token = resp.get_json()["url"].rsplit("/p/", 1)[-1]
+        self.assertNotEqual(new_token, token)
+        return new_token
+
+    def test_reissue_before_publish_full_flow(self):
+        # 甲已提交意见；乙（甲所评对象）改稿过一次；甲持有旧链接
+        self.assertEqual(submit_review(self.client, self.t_jia, "甲评乙", 1).status_code, 200)
+        self.assertEqual(
+            self.client.put(
+                f"/api/p/{self.t_yi}/manuscript", json={"manuscript": "文本二v2"}
+            ).status_code,
+            200,
+        )
+        self.assertEqual(submit_review(self.client, self.t_jia, "甲评乙新版", 2).status_code, 200)
+
+        new_jia = self._reissue()
+
+        # 旧链接：状态读取及一切合法写入一律 404，响应不泄露新链接
+        for method, path, body in (
+            ("GET", f"/api/p/{self.t_jia}", None),
+            ("PUT", f"/api/p/{self.t_jia}/manuscript", {"manuscript": "x"}),
+            ("POST", f"/api/p/{self.t_jia}/review", {"content": "x", "version": 2}),
+        ):
+            resp = self.client.open(path, method=method, json=body)
+            self.assertEqual(resp.status_code, 404, (method, path, resp.get_json()))
+            self.assertNotIn(new_jia, resp.get_data(as_text=True))
+
+        # 新链接沿用身份：姓名、稿件、版本、分配与意见状态全部不变
+        data = self.client.get(f"/api/p/{new_jia}").get_json()
+        self.assertEqual(data["name"], "甲")
+        self.assertEqual(data["manuscript"], "文本一")
+        self.assertEqual(data["version"], 1)
+        self.assertEqual(data["assignment"]["manuscript"], "文本二v2")
+        self.assertEqual(data["assignment"]["version"], 2)
+        self.assertEqual(data["my_review"]["content"], "甲评乙新版")
+        self.assertTrue(data["my_review"]["valid"])
+
+        # 主持台只显示新链接，不再显示旧链接
+        host = self.client.get(f"/api/h/{self.host_token}").get_json()
+        jia_link = next(l for l in host["links"] if l["name"] == "甲")
+        self.assertEqual(jia_link["url"], f"/p/{new_jia}")
+        host_body = self.client.get(f"/api/h/{self.host_token}").get_data(as_text=True)
+        self.assertNotIn(self.t_jia, host_body)
+
+        # 换发后新链接可继续正常工作：乙、丙补齐意见后公布
+        self.assertEqual(submit_review(self.client, self.t_yi, "乙评丙", 1).status_code, 200)
+        self.assertEqual(submit_review(self.client, self.t_bing, "丙评甲", 1).status_code, 200)
+        self.assertEqual(
+            self.client.post(f"/api/h/{self.host_token}/publish").status_code, 200
+        )
+        # 公布后新链接正常只读；旧链接仍 404
+        self.assertTrue(self.client.get(f"/api/p/{new_jia}").get_json()["published"])
+        self.assertEqual(self.client.get(f"/api/p/{self.t_jia}").status_code, 404)
+
+        # 其他人链接与数据不受影响
+        data_yi = self.client.get(f"/api/p/{self.t_yi}").get_json()
+        self.assertEqual(data_yi["name"], "乙")
+        self.assertEqual(data_yi["manuscript"], "文本二v2")
+
+    def test_reissue_after_publish_keeps_reviews_and_qa(self):
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+        # 公布后一问一答已发生：甲提问，丙答复
+        self.assertEqual(ask(self.client, self.t_jia, "甲的问题").status_code, 200)
+        self.assertEqual(answer(self.client, self.t_bing, "丙的答复").status_code, 200)
+
+        # 公布后换发仍允许
+        new_jia = self._reissue()
+        new_bing = self._reissue(token=self.t_bing, name="丙")
+
+        # 旧链接公布后同样全部失效（读、问、答均 404），且不泄露新链接
+        for old in (self.t_jia, self.t_bing):
+            resp = self.client.get(f"/api/p/{old}")
+            self.assertEqual(resp.status_code, 404)
+            self.assertNotIn(new_jia, resp.get_data(as_text=True))
+        self.assertEqual(ask(self.client, self.t_jia, "旧链接再问").status_code, 404)
+        self.assertEqual(answer(self.client, self.t_bing, "旧链接再答").status_code, 404)
+
+        # 甲的新链接：收到的意见与一问一答原样沿用，公布状态不变
+        da = self.client.get(f"/api/p/{new_jia}").get_json()
+        self.assertTrue(da["published"])
+        self.assertEqual(da["received"], "丙评甲")
+        self.assertEqual(
+            da["received_clarification"],
+            {"question": "甲的问题", "answer": "丙的答复", "answered": True},
+        )
+        # 丙的新链接：评审视角的问答沿用；身份未重建（意见未失效、仍为有效）
+        db = self.client.get(f"/api/p/{new_bing}").get_json()
+        self.assertEqual(db["my_review"]["content"], "丙评甲")
+        self.assertTrue(db["my_review"]["valid"])
+        self.assertEqual(
+            db["my_review_clarification"],
+            {"question": "甲的问题", "answer": "丙的答复", "answered": True},
+        )
+
+        # 乙与甲、丙无关的一切保持原样（其链接未变、收到乙视角数据不变）
+        data_yi = self.client.get(f"/api/p/{self.t_yi}").get_json()
+        self.assertEqual(data_yi["name"], "乙")
+        self.assertEqual(data_yi["received"], "甲评乙")
+        # 公布状态仍为已公布；再次公布仍 409（冻结规则不变）
+        self.assertEqual(
+            self.client.post(f"/api/h/{self.host_token}/publish").status_code, 409
+        )
+
+    def test_invalid_host_or_name_404(self):
+        # 无效主持链接：404，数据不变
+        resp = reissue(self.client, "无效主持链接", "甲", f"/p/{self.t_jia}")
+        self.assertEqual(resp.status_code, 404)
+        # 姓名不属于本会话（即使给出真实链接）：404
+        resp = reissue(self.client, self.host_token, "不存在的人", f"/p/{self.t_jia}")
+        self.assertEqual(resp.status_code, 404)
+        # 失败后原链接仍然有效
+        self.assertEqual(self.client.get(f"/api/p/{self.t_jia}").status_code, 200)
+        self.assertEqual(
+            self.client.get(f"/api/h/{self.host_token}")
+            .get_json()["links"][0]["url"],
+            f"/p/{self.t_jia}",
+        )
+
+    def test_stale_or_wrong_link_409(self):
+        # 请求体格式问题：400（沿用既有写接口风格）
+        self.assertEqual(
+            reissue(self.client, self.host_token, "甲", "不是链接").status_code, 400
+        )
+        self.assertEqual(
+            reissue(self.client, self.host_token, "  ", f"/p/{self.t_jia}").status_code,
+            400,
+        )
+
+        new_jia = self._reissue()
+
+        # 再次拿旧链接换发：所见链接已过期 → 409，不再生成更新的链接
+        resp = reissue(self.client, self.host_token, "甲", f"/p/{self.t_jia}")
+        self.assertEqual(resp.status_code, 409)
+        self.assertNotIn("url", resp.get_json())
+
+        # 张冠李戴：用乙的当前链接给甲换发 → 409
+        resp = reissue(self.client, self.host_token, "甲", f"/p/{self.t_yi}")
+        self.assertEqual(resp.status_code, 409)
+        # 用已作废的甲旧链接为乙换发 → 409
+        resp = reissue(self.client, self.host_token, "乙", f"/p/{self.t_jia}")
+        self.assertEqual(resp.status_code, 409)
+
+        # 全部失败：当前链接仍分别为新甲链接与原乙链接
+        host = self.client.get(f"/api/h/{self.host_token}").get_json()
+        urls = {l["name"]: l["url"] for l in host["links"]}
+        self.assertEqual(urls["甲"], f"/p/{new_jia}")
+        self.assertEqual(urls["乙"], f"/p/{self.t_yi}")
+
+        # 用最新链接还能继续再换发（第二次换发成功，第一次的新链接也随之作废）
+        resp = reissue(self.client, self.host_token, "甲", f"/p/{new_jia}")
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        new_jia2 = resp.get_json()["url"].rsplit("/p/", 1)[-1]
+        self.assertEqual(self.client.get(f"/api/p/{new_jia}").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/p/{new_jia2}").status_code, 200)
+
+    def test_concurrent_reissue_only_one_wins(self):
+        statuses = []
+
+        def worker():
+            c = new_client()
+            resp = reissue(c, self.host_token, "甲", f"/p/{self.t_jia}")
+            statuses.append((resp.status_code, resp.get_json().get("url")))
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+            self.assertFalse(t.is_alive())
+        oks = [s for s in statuses if s[0] == 200]
+        conflicts = [s for s in statuses if s[0] == 409]
+        self.assertEqual(len(oks), 1, statuses)
+        self.assertEqual(len(conflicts), 4, statuses)
+
+        new_token = oks[0][1].rsplit("/p/", 1)[-1]
+        # 旧链接作废、新链接有效；数据库中该参与者只有一个当前链接
+        self.assertEqual(self.client.get(f"/api/p/{self.t_jia}").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/p/{new_token}").status_code, 200)
+        conn = sqlite3.connect(app_module.DB_PATH)
+        try:
+            row = conn.execute(
+                "SELECT id, token FROM participants WHERE token=?", (new_token,)
+            ).fetchone()
+            self.assertIsNotNone(row)
+            archived = conn.execute(
+                "SELECT COUNT(*) FROM revoked_tokens WHERE participant_id=? AND token=?",
+                (row[0], self.t_jia),
+            ).fetchone()[0]
+            # 新 token 绝不出现在作废留档中；旧 token 恰留档一次
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM revoked_tokens WHERE token=?", (new_token,)
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            conn.close()
+        self.assertEqual(archived, 1)
+
+    def test_write_vs_reissue_commit_order(self):
+        # 顺序语义：旧凭据的写入先提交则保留，随后换发成功
+        resp = self.client.put(
+            f"/api/p/{self.t_jia}/manuscript", json={"manuscript": "甲改稿在先"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        new_jia = self._reissue()
+        data = self.client.get(f"/api/p/{new_jia}").get_json()
+        self.assertEqual(data["manuscript"], "甲改稿在先")
+        self.assertEqual(data["version"], 2)
+
+        # 顺序语义：换发先提交，则旧凭据之后的写入一律 404，数据不变
+        resp = self.client.put(
+            f"/api/p/{self.t_jia}/manuscript", json={"manuscript": "旧链接抢写"}
+        )
+        self.assertEqual(resp.status_code, 404)
+        data = self.client.get(f"/api/p/{new_jia}").get_json()
+        self.assertEqual(data["manuscript"], "甲改稿在先")
+        self.assertEqual(data["version"], 2)
+
+    def test_concurrent_reissue_vs_old_credential_write(self):
+        """换发与旧凭据写入并发：按写锁提交顺序，两种结局各自自洽。
+
+        - 换发先拿写锁：换发 200，旧凭据写入 404，甲稿不变；
+        - 写入先拿写锁：写入 200（保留），随后换发也 200，新链接读到改后稿件。
+        不会出现"旧链接在换发后仍写入成功"。
+        """
+        seen = set()
+        for _ in range(10):
+            client = new_client()
+            host, toks = create_session(client)
+            old = toks[0]
+            barrier = threading.Barrier(2)
+            outcome = {}
+
+            def reissuer():
+                barrier.wait()
+                c = new_client()
+                outcome["reissue"] = reissue(c, host, "甲", f"/p/{old}").status_code
+
+            def writer():
+                barrier.wait()
+                c = new_client()
+                outcome["write"] = c.put(
+                    f"/api/p/{old}/manuscript",
+                    json={"manuscript": "并发抢写"},
+                ).status_code
+
+            threads = [threading.Thread(target=reissuer), threading.Thread(target=writer)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+                self.assertFalse(t.is_alive())
+
+            current = "/api" + client.get(f"/api/h/{host}").get_json()["links"][0]["url"]
+            new_tok = current.rsplit("/p/", 1)[-1]
+            data = client.get(current).get_json()
+            if outcome["write"] == 404:
+                # 换发先提交：旧凭据写入被拒
+                self.assertEqual(outcome["reissue"], 200, outcome)
+                self.assertEqual(data["manuscript"], "文本一")
+                self.assertEqual(data["version"], 1)
+                seen.add("reissue_first")
+            else:
+                # 写入先提交：写入保留，换发随后成功（同一会话两个 200 均为有效结果）
+                self.assertEqual(outcome["write"], 200, outcome)
+                self.assertEqual(outcome["reissue"], 200, outcome)
+                self.assertEqual(data["manuscript"], "并发抢写")
+                self.assertEqual(data["version"], 2)
+                seen.add("write_first")
+            # 两种结局下旧链接都已作废
+            self.assertEqual(client.get(f"/api/p/{old}").status_code, 404)
+            if len(seen) == 2:
+                break
+
+        # 两种提交顺序都应实际被覆盖到（10 轮内）
+        self.assertEqual(seen, {"reissue_first", "write_first"})
+
+    def test_restart_keeps_new_link_and_revoked_old(self):
+        new_jia = self._reissue()
+        # 模拟容器重启：重新建库建表（幂等）
+        app_module.init_db()
+        self.assertEqual(self.client.get(f"/api/p/{new_jia}").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/p/{self.t_jia}").status_code, 404)
+        # 重启后仍可再次换发，且旧新两条链接都留档作废
+        resp = reissue(self.client, self.host_token, "甲", f"/p/{new_jia}")
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        newest = resp.get_json()["url"].rsplit("/p/", 1)[-1]
+        self.assertEqual(self.client.get(f"/api/p/{new_jia}").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/p/{newest}").status_code, 200)
+
+
 class OldSchemaMigrationTest(unittest.TestCase):
     """旧库启动时自动支持问答存储：补建 clarifications，旧数据保留，重启后内容保留。"""
 
@@ -596,6 +906,7 @@ class OldSchemaMigrationTest(unittest.TestCase):
             finally:
                 c.close()
             self.assertIn("clarifications", tables)
+            self.assertIn("revoked_tokens", tables)
 
             # 旧数据原样保留，且新表可直接读写
             client = new_client()
@@ -604,9 +915,22 @@ class OldSchemaMigrationTest(unittest.TestCase):
             self.assertEqual(data["received"], "旧意见")
             self.assertEqual(ask(client, "tk", "旧库追问").status_code, 200)
 
-            # 模拟重启：再次 init_db 幂等，问答内容保留
+            # 旧库上换发同样可用：旧链接作废、新链接沿用身份与问答
+            resp = client.post(
+                "/api/h/ht/reissue", json={"name": "旧库作者", "url": "/p/tk"}
+            )
+            self.assertEqual(resp.status_code, 200, resp.get_json())
+            new_tk = resp.get_json()["url"].rsplit("/p/", 1)[-1]
+            self.assertEqual(client.get("/api/p/tk").status_code, 404)
+            data = client.get(f"/api/p/{new_tk}").get_json()
+            self.assertEqual(data["name"], "旧库作者")
+            self.assertEqual(data["received"], "旧意见")
+            self.assertEqual(data["received_clarification"]["question"], "旧库追问")
+
+            # 模拟重启：再次 init_db 幂等，问答内容保留，新链接仍有效、旧链接仍作废
             app_module.init_db()
-            data = client.get("/api/p/tk").get_json()
+            self.assertEqual(client.get("/api/p/tk").status_code, 404)
+            data = client.get(f"/api/p/{new_tk}").get_json()
             self.assertEqual(data["received_clarification"]["question"], "旧库追问")
         finally:
             app_module.DB_PATH = original

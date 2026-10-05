@@ -8,6 +8,9 @@
 - 每篇当前稿都有有效意见时才可一次公布；公布后作者可见匿名意见，稿件与意见锁定。
 - 公布后作者可对收到的意见提一次澄清问题，对应评审者答复一次；每条意见一问一答，
   问答只随参与状态快照返回给该作者与评审者，主持台与其他参与者均不可见。
+- 个人链接泄露时主持人可在主持台为某人换发链接（公布前后均可）：旧链接留档作废，
+  之后持旧链接的一切读取与写入均 404；新随机链接沿用同一参与者的稿件、版本、分配、
+  意见与问答，不重建身份、不使意见失效，其他人的链接与公布状态不变。
 - 所有写操作在 BEGIN IMMEDIATE 事务内"先检查后变更"，拒绝即整体回滚，不留部分变更。
 - 状态读取（参与页、主持台）在单个只读事务内完成：整个响应取自同一快照；
   WAL 下读取不阻塞其他连接的写入，写入也不阻塞读取。
@@ -66,6 +69,13 @@ CREATE TABLE IF NOT EXISTS clarifications (
     asked_at TEXT NOT NULL DEFAULT (datetime('now')),
     answered_at TEXT
 );
+-- 换发链接：作废的旧个人链接留档，使其与从未签发的链接一样 404；
+-- 换发只换凭据不换身份，participants 行及其稿件/意见/问答全部沿用
+CREATE TABLE IF NOT EXISTS revoked_tokens (
+    token TEXT PRIMARY KEY,
+    participant_id INTEGER NOT NULL REFERENCES participants(id),
+    revoked_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 app = Flask(__name__)
@@ -74,8 +84,8 @@ app = Flask(__name__)
 def init_db():
     """建库建表（幂等），数据落盘在 DB_PATH，重启后保留。
 
-    旧版数据库（无 clarifications 表）启动时自动补建问答表，
-    既有 sessions/participants/reviews 数据原样保留。
+    旧版数据库（无 clarifications / revoked_tokens 表）启动时自动补建
+    问答表与换发留档表，既有 sessions/participants/reviews 数据原样保留。
     """
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -141,6 +151,35 @@ def find_participant(conn, token):
     return conn.execute(
         "SELECT * FROM participants WHERE token=?", (token,)
     ).fetchone()
+
+
+def token_is_revoked(conn, token):
+    return conn.execute(
+        "SELECT 1 FROM revoked_tokens WHERE token=?", (token,)
+    ).fetchone() is not None
+
+
+def new_participant_token(conn):
+    """生成在当前链接与作废留档中都不重复的随机个人链接凭据。"""
+    while True:
+        token = secrets.token_urlsafe(24)
+        exists = conn.execute(
+            "SELECT 1 FROM participants WHERE token=?"
+            " UNION ALL SELECT 1 FROM revoked_tokens WHERE token=? LIMIT 1",
+            (token, token),
+        ).fetchone()
+        if exists is None:
+            return token
+
+
+def extract_personal_token(url):
+    """从页面所见个人链接（/p/<token> 或完整 URL）中解析 token；格式不符返回 None。"""
+    if not isinstance(url, str) or "/p/" not in url:
+        return None
+    token = url.rsplit("/p/", 1)[1].strip()
+    if not token or "/" in token or "?" in token or "#" in token:
+        return None
+    return token
 
 
 def find_review_by_reviewer(conn, session_id, reviewer_id):
@@ -227,7 +266,7 @@ def create_session():
         session_id = cur.lastrowid
         links = []
         for i, (name, text) in enumerate(cleaned):
-            token = secrets.token_urlsafe(24)
+            token = new_participant_token(conn)
             conn.execute(
                 "INSERT INTO participants (session_id, token, name, position, manuscript)"
                 " VALUES (?,?,?,?,?)",
@@ -312,6 +351,64 @@ def publish(host_token):
         conn.execute("UPDATE sessions SET published=1 WHERE id=?", (session["id"],))
         conn.commit()
         return jsonify({"ok": True})
+    except Exception:
+        conn.rollback()
+        raise
+
+
+@app.post("/api/h/<host_token>/reissue")
+def reissue_link(host_token):
+    """主持人为本会话某人换发个人链接（公布前后均可）。
+
+    请求体携带姓名与主持页所见的个人链接：
+    - 主持链接无效或姓名不在本会话：404；
+    - 所见链接已不是该人当前链接（已过期/已作废，或并非该人链接）：409；
+    - 成功则生成新随机链接，旧链接留档作废；响应与主持台返回新链接，
+      任何情况下都不通过旧链接泄露新链接。
+    写事务串行化保证：同一旧链接并发换发至多一次成功；换发与旧凭据上的写操作
+    （改稿/意见/问题/答复）按提交顺序生效——先提交的写入保留，换发后的旧凭据写入 404。
+    """
+    data = request.get_json(silent=True) or {}
+    name = data.get("name")
+    url = data.get("url")
+    if not isinstance(name, str) or not name.strip():
+        return err("请指定姓名")
+    name = name.strip()
+    old_token = extract_personal_token(url)
+    if old_token is None:
+        return err("请提供页面所见的个人链接")
+
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        session = find_session_by_host(conn, host_token)
+        if session is None:
+            conn.rollback()
+            return err("主持链接无效", 404)
+        person = conn.execute(
+            "SELECT * FROM participants WHERE session_id=? AND name=?",
+            (session["id"], name),
+        ).fetchone()
+        if person is None:
+            # 姓名不属于本会话：与主持链接无效同返回 404
+            conn.rollback()
+            return err("本会话没有该姓名的人员", 404)
+        # 所见链接必须仍是该人的当前链接：已作废（含并发换发先成功）或张冠李戴均 409
+        if person["token"] != old_token or token_is_revoked(conn, old_token):
+            conn.rollback()
+            return err("所见个人链接已过期，请刷新主持页获取最新链接", 409)
+        new_token = new_participant_token(conn)
+        # 同一事务内换凭据：旧链接留档作废，参与者身份行及其稿件/版本/意见/问答全部沿用
+        conn.execute(
+            "UPDATE participants SET token=? WHERE id=? AND token=?",
+            (new_token, person["id"], old_token),
+        )
+        conn.execute(
+            "INSERT INTO revoked_tokens (token, participant_id) VALUES (?,?)",
+            (old_token, person["id"]),
+        )
+        conn.commit()
+        return jsonify({"ok": True, "name": name, "url": f"/p/{new_token}"})
     except Exception:
         conn.rollback()
         raise

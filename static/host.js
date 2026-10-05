@@ -3,6 +3,12 @@
 const token = location.pathname.split("/").filter(Boolean)[1];
 const errorEl = document.getElementById("error");
 const publishBtn = document.getElementById("publish");
+const reissueMsgEl = document.getElementById("reissue-msg");
+
+function setReissueMsg(text, isError) {
+  reissueMsgEl.textContent = text || "";
+  reissueMsgEl.className = isError ? "error" : "ok";
+}
 
 async function refresh() {
   let s;
@@ -59,10 +65,48 @@ function render(s) {
     a.href = location.origin + l.url;
     a.textContent = location.origin + l.url;
     tdLink.appendChild(a);
-    tr.append(tdName, tdLink);
+    const tdAction = document.createElement("td");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "reissue-btn";
+    btn.textContent = "换发链接";
+    btn.dataset.name = l.name;
+    btn.dataset.url = l.url;
+    tdAction.appendChild(btn);
+    tr.append(tdName, tdLink, tdAction);
     linksBody.appendChild(tr);
   }
 }
+
+// 换发：提交主持链接（路径中）、姓名与页面所见个人链接（当前渲染值）
+document.getElementById("links").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest(".reissue-btn");
+  if (!btn) return;
+  const name = btn.dataset.name;
+  const url = btn.dataset.url;
+  if (!confirm("确定为「" + name + "」换发个人链接？\n旧链接会立即失效，对方需改用新链接。")) return;
+  btn.disabled = true;
+  setReissueMsg("正在为「" + name + "」换发……", false);
+  try {
+    const r = await fetch("/api/h/" + token + "/reissue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, url }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      btn.disabled = false;
+      setReissueMsg((data.error || "换发失败") + "（" + name + "）", true);
+    } else {
+      const fullUrl = location.origin + data.url;
+      setReissueMsg("「" + name + "」的新链接：" + fullUrl + "，旧链接已作废。", false);
+    }
+  } catch {
+    btn.disabled = false;
+    setReissueMsg("网络错误，请重试", true);
+  }
+  refresh();
+});
 
 publishBtn.addEventListener("click", async () => {
   if (!confirm("确定公布？公布后稿件与意见均不可再修改。")) return;
